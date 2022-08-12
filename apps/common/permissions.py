@@ -2,11 +2,14 @@
 #
 import time
 
-from rest_framework import permissions
-from django.contrib.auth.mixins import UserPassesTestMixin
 from django.conf import settings
+from rest_framework import permissions
 
-from orgs.utils import current_org
+from authentication.const import ConfirmType
+from common.exceptions import UserConfirmRequired
+from orgs.utils import tmp_to_root_org
+from authentication.models import ConnectionToken
+from common.utils import get_object_or_none
 
 
 class IsValidUser(permissions.IsAuthenticated, permissions.BasePermission):
@@ -14,77 +17,29 @@ class IsValidUser(permissions.IsAuthenticated, permissions.BasePermission):
 
     def has_permission(self, request, view):
         return super(IsValidUser, self).has_permission(request, view) \
-            and request.user.is_valid
+               and request.user.is_valid
 
 
-class IsAppUser(IsValidUser):
-    """Allows access only to app user """
+class IsValidUserOrConnectionToken(IsValidUser):
 
     def has_permission(self, request, view):
-        return super(IsAppUser, self).has_permission(request, view) \
-            and request.user.is_app
+        return super(IsValidUserOrConnectionToken, self).has_permission(request, view) \
+               or self.is_valid_connection_token(request)
+
+    @staticmethod
+    def is_valid_connection_token(request):
+        token_id = request.query_params.get('token')
+        if not token_id:
+            return False
+        with tmp_to_root_org():
+            token = get_object_or_none(ConnectionToken, id=token_id)
+        return token and token.is_valid
 
 
-class IsSuperUser(IsValidUser):
+class OnlySuperUser(IsValidUser):
     def has_permission(self, request, view):
-        return super(IsSuperUser, self).has_permission(request, view) \
+        return super().has_permission(request, view) \
                and request.user.is_superuser
-
-
-class IsSuperUserOrAppUser(IsSuperUser):
-    def has_permission(self, request, view):
-        return super(IsSuperUserOrAppUser, self).has_permission(request, view) \
-            or request.user.is_app
-
-
-class IsSuperAuditor(IsValidUser):
-    def has_permission(self, request, view):
-        return super(IsSuperAuditor, self).has_permission(request, view) \
-               and request.user.is_super_auditor
-
-
-class IsOrgAuditor(IsValidUser):
-    def has_permission(self, request, view):
-        if not current_org:
-            return False
-        return super(IsOrgAuditor, self).has_permission(request, view) \
-               and current_org.can_audit_by(request.user)
-
-
-class IsOrgAdmin(IsValidUser):
-    """Allows access only to superuser"""
-
-    def has_permission(self, request, view):
-        if not current_org:
-            return False
-        return super(IsOrgAdmin, self).has_permission(request, view) \
-            and current_org.can_admin_by(request.user)
-
-
-class IsOrgAdminOrAppUser(IsValidUser):
-    """Allows access between superuser and app user"""
-
-    def has_permission(self, request, view):
-        if not current_org:
-            return False
-        return super(IsOrgAdminOrAppUser, self).has_permission(request, view) \
-            and (current_org.can_admin_by(request.user) or request.user.is_app)
-
-
-class IsOrgAdminOrAppUserOrUserReadonly(IsOrgAdminOrAppUser):
-    def has_permission(self, request, view):
-        if IsValidUser.has_permission(self, request, view) \
-                and request.method in permissions.SAFE_METHODS:
-            return True
-        else:
-            return IsOrgAdminOrAppUser.has_permission(self, request, view)
-
-
-class IsCurrentUserOrReadOnly(permissions.BasePermission):
-    def has_object_permission(self, request, view, obj):
-        if request.method in permissions.SAFE_METHODS:
-            return True
-        return obj == request.user
 
 
 class WithBootstrapToken(permissions.BasePermission):
@@ -96,99 +51,26 @@ class WithBootstrapToken(permissions.BasePermission):
         return settings.BOOTSTRAP_TOKEN == request_bootstrap_token
 
 
-class PermissionsMixin(UserPassesTestMixin):
-    permission_classes = []
+class UserConfirmation(permissions.BasePermission):
+    ttl = 60 * 5
+    min_level = 1
+    confirm_type = ConfirmType.ReLogin
 
-    def get_permissions(self):
-        return self.permission_classes
-
-    def test_func(self):
-        permission_classes = self.get_permissions()
-        for permission_class in permission_classes:
-            if not permission_class().has_permission(self.request, self):
-                return False
-        return True
-
-
-class UserCanUpdatePassword:
     def has_permission(self, request, view):
-        return request.user.can_update_password()
-
-
-class UserCanUpdateSSHKey:
-    def has_permission(self, request, view):
-        return request.user.can_update_ssh_key()
-
-
-class NeedMFAVerify(permissions.BasePermission):
-    def has_permission(self, request, view):
-        mfa_verify_time = request.session.get('MFA_VERIFY_TIME', 0)
-        if time.time() - mfa_verify_time < settings.SECURITY_MFA_VERIFY_TTL:
+        if not settings.SECURITY_VIEW_AUTH_NEED_MFA:
             return True
-        return False
 
+        confirm_level = request.session.get('CONFIRM_LEVEL')
+        confirm_time = request.session.get('CONFIRM_TIME')
 
-class CanUpdateDeleteUser(permissions.BasePermission):
-
-    @staticmethod
-    def has_delete_object_permission(request, view, obj):
-        if request.user.is_anonymous:
-            return False
-        if not request.user.can_admin_current_org:
-            return False
-        # 超级管理员 / 组织管理员
-        if str(request.user.id) == str(obj.id):
-            return False
-        # 超级管理员
-        if request.user.is_superuser:
-            if obj.is_superuser and obj.username in ['admin']:
-                return False
-            return True
-        # 组织管理员
-        if obj.is_superuser:
-            return False
-        if obj.is_super_auditor:
-            return False
-        if obj.is_org_admin:
-            return False
-        if len(obj.audit_orgs) > 1:
-            return False
-        if len(obj.user_orgs) > 1:
-            return False
+        if not confirm_level or not confirm_time or \
+                confirm_level < self.min_level or \
+                confirm_time < time.time() - self.ttl:
+            raise UserConfirmRequired(code=self.confirm_type)
         return True
 
-    @staticmethod
-    def has_update_object_permission(request, view, obj):
-        if request.user.is_anonymous:
-            return False
-        if not request.user.can_admin_current_org:
-            return False
-        # 超级管理员 / 组织管理员
-        if str(request.user.id) == str(obj.id):
-            return True
-        # 超级管理员
-        if request.user.is_superuser:
-            return True
-        # 组织管理员
-        if obj.is_superuser:
-            return False
-        if obj.is_super_auditor:
-            return False
-        if obj.is_org_admin:
-            return False
-        if len(obj.audit_orgs) > 1:
-            return False
-        if len(obj.user_orgs) > 1:
-            return False
-        return True
-
-    def has_object_permission(self, request, view, obj):
-        if request.user.is_anonymous:
-            return False
-        if not request.user.can_admin_current_org:
-            return False
-        if request.method in ['DELETE']:
-            return self.has_delete_object_permission(request, view, obj)
-        if request.method in ['PUT', 'PATCH']:
-            return self.has_update_object_permission(request, view, obj)
-        return True
+    @classmethod
+    def require(cls, confirm_type=ConfirmType.ReLogin, ttl=300):
+        min_level = ConfirmType.values.index(confirm_type) + 1
+        name = 'UserConfirmationLevel{}TTL{}'.format(min_level, ttl)
+        return type(name, (cls,), {'min_level': min_level, 'ttl': ttl, 'confirm_type': confirm_type})

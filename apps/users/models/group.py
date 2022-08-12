@@ -4,6 +4,7 @@ import uuid
 from django.db import models, IntegrityError
 from django.utils.translation import ugettext_lazy as _
 
+from common.utils import lazyproperty
 from orgs.mixins.models import OrgModelMixin
 
 __all__ = ['UserGroup']
@@ -20,6 +21,10 @@ class UserGroup(OrgModelMixin):
     def __str__(self):
         return self.name
 
+    @lazyproperty
+    def users_amount(self):
+        return self.users.count()
+
     class Meta:
         ordering = ['name']
         unique_together = [('org_id', 'name'),]
@@ -34,20 +39,3 @@ class UserGroup(OrgModelMixin):
         else:
             group = default_group[0]
         return group
-
-    @classmethod
-    def generate_fake(cls, count=100):
-        from random import seed, choice
-        import forgery_py
-        from . import User
-
-        seed()
-        for i in range(count):
-            group = cls(name=forgery_py.name.full_name(),
-                        comment=forgery_py.lorem_ipsum.sentence(),
-                        created_by=choice(User.objects.all()).username)
-            try:
-                group.save()
-            except IntegrityError:
-                print('Error continue')
-                continue

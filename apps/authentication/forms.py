@@ -1,66 +1,87 @@
 # -*- coding: utf-8 -*-
 #
-
 from django import forms
-from django.contrib.auth.forms import AuthenticationForm
-from django.utils.translation import gettext_lazy as _
-from captcha.fields import CaptchaField
 from django.conf import settings
-from users.utils import get_login_failed_count
+from django.utils.translation import ugettext_lazy as _
+from captcha.fields import CaptchaField, CaptchaTextInput
+
+from common.utils import get_logger, decrypt_password
+
+logger = get_logger(__name__)
 
 
-class UserLoginForm(AuthenticationForm):
-    username = forms.CharField(label=_('Username'), max_length=100)
-    password = forms.CharField(
+class EncryptedField(forms.CharField):
+    def to_python(self, value):
+        value = super().to_python(value)
+        return decrypt_password(value)
+
+
+class UserLoginForm(forms.Form):
+    days_auto_login = int(settings.SESSION_COOKIE_AGE / 3600 / 24)
+    disable_days_auto_login = settings.SESSION_EXPIRE_AT_BROWSER_CLOSE_FORCE \
+                              or days_auto_login < 1
+
+    username = forms.CharField(
+        label=_('Username'), max_length=100,
+        widget=forms.TextInput(attrs={
+            'placeholder': _("Username"),
+            'autofocus': 'autofocus'
+        })
+    )
+    password = EncryptedField(
         label=_('Password'), widget=forms.PasswordInput,
-        max_length=128, strip=False
+        max_length=1024, strip=False
+    )
+    auto_login = forms.BooleanField(
+        required=False, initial=False,
+        widget=forms.CheckboxInput(
+            attrs={'disabled': disable_days_auto_login}
+        )
     )
 
-    error_messages = {
-        'invalid_login': _(
-            "The username or password you entered is incorrect, "
-            "please enter it again."
-        ),
-        'inactive': _("This account is inactive."),
-        'limit_login': _(
-            "You can also try {times_try} times "
-            "(The account will be temporarily locked for {block_time} minutes)"
-        ),
-        'block_login': _(
-            "The account has been locked "
-            "(please contact admin to unlock it or try again after {} minutes)"
-        )
-    }
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        auto_login_field = self.fields['auto_login']
+        auto_login_field.label = _("{} days auto login").format(self.days_auto_login or 1)
 
     def confirm_login_allowed(self, user):
         if not user.is_staff:
             raise forms.ValidationError(
                 self.error_messages['inactive'],
-                code='inactive',)
-
-    def get_limit_login_error_message(self, username, ip):
-        times_up = settings.SECURITY_LOGIN_LIMIT_COUNT
-        times_failed = get_login_failed_count(username, ip)
-        times_try = int(times_up) - int(times_failed)
-        block_time = settings.SECURITY_LOGIN_LIMIT_TIME
-        if times_try <= 0:
-            error_message = self.error_messages['block_login']
-            error_message = error_message.format(block_time)
-        else:
-            error_message = self.error_messages['limit_login']
-            error_message = error_message.format(
-                times_try=times_try, block_time=block_time,
+                code='inactive',
             )
-        return error_message
-
-    def add_limit_login_error(self, username, ip):
-        error = self.get_limit_login_error_message(username, ip)
-        self.add_error('password', error)
-
-
-class UserLoginCaptchaForm(UserLoginForm):
-    captcha = CaptchaField()
 
 
 class UserCheckOtpCodeForm(forms.Form):
-    otp_code = forms.CharField(label=_('MFA code'), max_length=6)
+    code = forms.CharField(label=_('MFA Code'), max_length=128, required=False)
+    mfa_type = forms.CharField(label=_('MFA type'), max_length=128)
+
+
+class CustomCaptchaTextInput(CaptchaTextInput):
+    template_name = 'authentication/_captcha_field.html'
+
+
+class CaptchaMixin(forms.Form):
+    captcha = CaptchaField(widget=CustomCaptchaTextInput)
+
+
+class ChallengeMixin(forms.Form):
+    challenge = forms.CharField(
+        label=_('MFA code'), max_length=128, required=False,
+        widget=forms.TextInput(attrs={
+            'placeholder': _("Dynamic code"),
+            'style': 'width: 50%'
+        })
+    )
+
+
+def get_user_login_form_cls(*, captcha=False):
+    bases = []
+    if settings.SECURITY_LOGIN_CHALLENGE_ENABLED:
+        bases.append(ChallengeMixin)
+    elif settings.SECURITY_MFA_IN_LOGIN_PAGE:
+        bases.append(UserCheckOtpCodeForm)
+    elif settings.SECURITY_LOGIN_CAPTCHA_ENABLED and captcha:
+        bases.append(CaptchaMixin)
+    bases.append(UserLoginForm)
+    return type('UserLoginForm', tuple(bases), {})

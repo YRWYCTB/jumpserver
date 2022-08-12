@@ -7,12 +7,11 @@ from celery import subtask
 from celery.signals import (
     worker_ready, worker_shutdown, after_setup_logger
 )
-from kombu.utils.encoding import safe_str
 from django_celery_beat.models import PeriodicTask
 
 from common.utils import get_logger
 from .decorator import get_after_app_ready_tasks, get_after_app_shutdown_clean_tasks
-from .logger import CeleryTaskFileHandler
+from .logger import CeleryThreadTaskFileHandler
 
 logger = get_logger(__file__)
 safe_str = lambda x: x
@@ -45,7 +44,7 @@ def after_app_shutdown_periodic_tasks(sender=None, **kwargs):
 def add_celery_logger_handler(sender=None, logger=None, loglevel=None, format=None, **kwargs):
     if not logger:
         return
-    task_handler = CeleryTaskFileHandler()
+    task_handler = CeleryThreadTaskFileHandler()
     task_handler.setLevel(loglevel)
     formatter = logging.Formatter(format)
     task_handler.setFormatter(formatter)

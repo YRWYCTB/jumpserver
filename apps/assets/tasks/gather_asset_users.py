@@ -2,14 +2,15 @@
 
 import re
 from collections import defaultdict
+
 from celery import shared_task
+from django.utils.translation import gettext_noop
+from django.utils import timezone
 
-from django.utils.translation import ugettext as _
-
-from orgs.utils import tmp_to_org
+from orgs.utils import tmp_to_org, org_aware_func
 from common.utils import get_logger
 from ..models import GatheredUser, Node
-from .utils import clean_hosts
+from .utils import clean_ansible_task_hosts
 from . import const
 
 __all__ = ['gather_asset_users', 'gather_nodes_asset_users']
@@ -19,19 +20,25 @@ ignore_login_shell = re.compile(r'nologin$|sync$|shutdown$|halt$')
 
 
 def parse_linux_result_to_users(result):
-    task_result = {}
-    for task_name, raw in result.items():
-        res = raw.get('ansible_facts', {}).get('getent_passwd')
-        if res:
-            task_result = res
-            break
-    if not task_result or not isinstance(task_result, dict):
-        return []
-    users = []
-    for username, attr in task_result.items():
+    users = defaultdict(dict)
+    users_result = result.get('gather host users', {})\
+        .get('ansible_facts', {})\
+        .get('getent_passwd')
+    if not isinstance(users_result, dict):
+        users_result = {}
+    for username, attr in users_result.items():
         if ignore_login_shell.search(attr[-1]):
             continue
-        users.append(username)
+        users[username] = {}
+    last_login_result = result.get('get last login', {}).get('stdout_lines', [])
+    for line in last_login_result:
+        data = line.split('@')
+        if len(data) != 3:
+            continue
+        username, ip, dt = data
+        dt += ' +0800'
+        date = timezone.datetime.strptime(dt, '%b %d %H:%M:%S %Y %z')
+        users[username] = {"ip": ip, "date": date}
     return users
 
 
@@ -45,7 +52,7 @@ def parse_windows_result_to_users(result):
     if not task_result:
         return []
 
-    users = []
+    users = {}
 
     for i in range(4):
         task_result.pop(0)
@@ -53,9 +60,12 @@ def parse_windows_result_to_users(result):
         task_result.pop()
 
     for line in task_result:
-        user = space.split(line)
-        if user[0]:
-            users.append(user[0])
+        username_list = space.split(line)
+        #  such as: ['Admini', 'appadm', 'DefaultAccount', '']
+        for username in username_list:
+            if not username:
+                continue
+            users[username] = {}
     return users
 
 
@@ -82,19 +92,24 @@ def add_asset_users(assets, results):
         with tmp_to_org(asset.org_id):
             GatheredUser.objects.filter(asset=asset, present=True)\
                 .update(present=False)
-            for username in users:
+            for username, data in users.items():
                 defaults = {'asset': asset, 'username': username, 'present': True}
+                if data.get("ip"):
+                    defaults["ip_last_login"] = data["ip"][:32]
+                if data.get("date"):
+                    defaults["date_last_login"] = data["date"]
                 GatheredUser.objects.update_or_create(
                     defaults=defaults, asset=asset, username=username,
                 )
 
 
 @shared_task(queue="ansible")
+@org_aware_func("assets")
 def gather_asset_users(assets, task_name=None):
     from ops.utils import update_or_create_ansible_task
     if task_name is None:
-        task_name = _("Gather assets users")
-    assets = clean_hosts(assets)
+        task_name = gettext_noop("Gather assets users")
+    assets = clean_ansible_task_hosts(assets)
     if not assets:
         return
     hosts_category = {
@@ -120,7 +135,7 @@ def gather_asset_users(assets, task_name=None):
         task, created = update_or_create_ansible_task(
             task_name=_task_name, hosts=value['hosts'], tasks=value['tasks'],
             pattern='all', options=const.TASK_OPTIONS,
-            run_as_admin=True, created_by=value['hosts'][0].org_id,
+            run_as_admin=True,
         )
         raw, summary = task.run()
         results[k].update(raw['ok'])
@@ -129,7 +144,8 @@ def gather_asset_users(assets, task_name=None):
 
 @shared_task(queue="ansible")
 def gather_nodes_asset_users(nodes_key):
-    assets = Node.get_nodes_all_assets(nodes_key)
+    nodes = Node.objects.filter(key__in=nodes_key)
+    assets = Node.get_nodes_all_assets(*nodes)
     assets_groups_by_100 = [assets[i:i+100] for i in range(0, len(assets), 100)]
     for _assets in assets_groups_by_100:
         gather_asset_users(_assets)

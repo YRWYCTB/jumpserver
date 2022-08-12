@@ -1,36 +1,38 @@
 # -*- coding: utf-8 -*-
 #
 
-import traceback
 from django.db import models
 from django.utils.translation import ugettext_lazy as _
 from django.core.exceptions import ValidationError
 
 from common.utils import get_logger
 from ..utils import (
-    set_current_org, get_current_org, current_org,
-    get_org_filters
+    set_current_org, get_current_org, current_org, filter_org_queryset
 )
 from ..models import Organization
 
 logger = get_logger(__file__)
 
 __all__ = [
-    'OrgManager', 'OrgModelMixin',
+    'OrgManager', 'OrgModelMixin', 'Organization'
 ]
 
 
-class OrgQuerySet(models.QuerySet):
-    pass
-
-
 class OrgManager(models.Manager):
+
+    def all_group_by_org(self):
+        from ..models import Organization
+        orgs = list(Organization.objects.all())
+        querysets = {}
+        for org in orgs:
+            org_id = org.id
+            queryset = super(OrgManager, self).get_queryset().filter(org_id=org_id)
+            querysets[org] = queryset
+        return querysets
+
     def get_queryset(self):
-        queryset = super().get_queryset()
-        kwargs = get_org_filters()
-        if kwargs:
-            return queryset.filter(**kwargs)
-        return queryset
+        queryset = super(OrgManager, self).get_queryset()
+        return filter_org_queryset(queryset)
 
     def set_current_org(self, org):
         if isinstance(org, str):
@@ -38,44 +40,41 @@ class OrgManager(models.Manager):
         set_current_org(org)
         return self
 
-    def all(self):
-        # print("Call all: {}".format(current_org))
-        #
-        # lines = traceback.format_stack()
-        # print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-        # for line in lines[-10:-1]:
-        #     print(line)
-        # print("<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
-        if not current_org:
-            msg = 'You can `objects.set_current_org(org).all()` then run it'
-            return self
-        else:
-            return super().all()
+
+    def bulk_create(self, objs, batch_size=None, ignore_conflicts=False):
+        org = get_current_org()
+        for obj in objs:
+            if org.is_root():
+                if not self.org_id:
+                    raise ValidationError('Please save in a organization')
+            else:
+                obj.org_id = org.id
+        return super().bulk_create(objs, batch_size, ignore_conflicts)
 
 
 class OrgModelMixin(models.Model):
-    org_id = models.CharField(max_length=36, blank=True, default='',
-                              verbose_name=_("Organization"), db_index=True)
+    org_id = models.CharField(
+        max_length=36, blank=True, default='', verbose_name=_("Organization"), db_index=True
+    )
     objects = OrgManager()
 
     sep = '@'
 
     def save(self, *args, **kwargs):
         org = get_current_org()
-        if org is None:
-            return super().save(*args, **kwargs)
-
-        if org.is_real() or org.is_system():
+        # 这里不可以优化成, 因为 root 组织下可以设置组织 id 来保存
+        # if org.is_root() and not self.org_id:
+        #     raise ...
+        if org.is_root():
+            if not self.org_id:
+                raise ValidationError('Please save in a organization')
+        else:
             self.org_id = org.id
-        elif org.is_default():
-            self.org_id = ''
         return super().save(*args, **kwargs)
 
     @property
     def org(self):
-        from orgs.models import Organization
-        org = Organization.get_instance(self.org_id)
-        return org
+        return Organization.get_instance(self.org_id)
 
     @property
     def org_name(self):
@@ -90,10 +89,7 @@ class OrgModelMixin(models.Model):
             name = self.name
         elif hasattr(self, 'hostname'):
             name = self.hostname
-        if self.org.is_real():
-            return name + self.sep + self.org_name
-        else:
-            return name
+        return name + self.sep + self.org_name
 
     def validate_unique(self, exclude=None):
         """
@@ -101,7 +97,7 @@ class OrgModelMixin(models.Model):
         failed.
         Form 提交时会使用这个检验
         """
-        self.org_id = current_org.id if current_org.is_real() else ''
+        self.org_id = current_org.id
         if exclude and 'org_id' in exclude:
             exclude.remove('org_id')
         unique_checks, date_checks = self._get_unique_checks(exclude=exclude)

@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 #
-from django.shortcuts import get_object_or_404
-from rest_framework.viewsets import ModelViewSet
+from rest_framework.viewsets import ModelViewSet, GenericViewSet
 from rest_framework_bulk import BulkModelViewSet
-from common.mixins import CommonApiMixin
 
-from ..utils import set_to_root_org, filter_org_queryset
-from ..models import Organization
+from common.mixins import CommonApiMixin, RelationMixin
+from orgs.utils import current_org
+
+from ..utils import set_to_root_org
 
 __all__ = [
-    'RootOrgViewMixin', 'OrgMembershipModelViewSetMixin', 'OrgModelViewSet',
-    'OrgBulkModelViewSet', 'OrgQuerySetMixin',
+    'RootOrgViewMixin', 'OrgModelViewSet', 'OrgBulkModelViewSet', 'OrgQuerySetMixin',
+    'OrgGenericViewSet', 'OrgRelationMixin'
 ]
 
 
@@ -33,42 +33,42 @@ class OrgQuerySetMixin:
 
         if hasattr(self, 'swagger_fake_view'):
             return queryset[:1]
-        if hasattr(self, 'action') and self.action == 'list' and \
-            hasattr(self, 'serializer_class') and \
-                hasattr(self.serializer_class, 'setup_eager_loading'):
-            queryset = self.serializer_class.setup_eager_loading(queryset)
+        if hasattr(self, 'action') and self.action == 'list':
+            serializer_class = self.get_serializer_class()
+            if serializer_class and hasattr(serializer_class, 'setup_eager_loading'):
+                queryset = serializer_class.setup_eager_loading(queryset)
         return queryset
 
 
-class OrgModelViewSet(CommonApiMixin, OrgQuerySetMixin, ModelViewSet):
+class OrgViewSetMixin(OrgQuerySetMixin):
     pass
 
 
-class OrgBulkModelViewSet(CommonApiMixin, OrgQuerySetMixin, BulkModelViewSet):
+class OrgModelViewSet(CommonApiMixin, OrgViewSetMixin, ModelViewSet):
+    pass
+
+
+class OrgGenericViewSet(CommonApiMixin, OrgViewSetMixin, GenericViewSet):
+    pass
+
+
+class OrgBulkModelViewSet(CommonApiMixin, OrgViewSetMixin, BulkModelViewSet):
     def allow_bulk_destroy(self, qs, filtered):
-        if qs.count() <= filtered.count():
-            return False
+        qs_count = qs.count()
+        filtered_count = filtered.count()
+        if filtered_count == 1:
+            return True
+        if qs_count > filtered_count:
+            return True
         if self.request.query_params.get('spm', ''):
             return True
         return False
 
 
-class OrgMembershipModelViewSetMixin:
-    org = None
-    membership_class = None
-    lookup_field = 'user'
-    lookup_url_kwarg = 'user_id'
-    http_method_names = ['get', 'post', 'delete', 'head', 'options']
-
-    def dispatch(self, request, *args, **kwargs):
-        self.org = get_object_or_404(Organization, pk=kwargs.get('org_id'))
-        return super().dispatch(request, *args, **kwargs)
-
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context['org'] = self.org
-        return context
-
+class OrgRelationMixin(RelationMixin):
     def get_queryset(self):
-        queryset = self.membership_class.objects.filter(organization=self.org)
+        queryset = super().get_queryset()
+        if not current_org.is_root():
+            org_id = current_org.org_id()
+            queryset = queryset.filter(**{f'{self.from_field}__org_id': org_id})
         return queryset

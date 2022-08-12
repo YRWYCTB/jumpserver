@@ -5,17 +5,24 @@ import os
 import re
 
 from django.utils.translation import ugettext as _
+from rest_framework import viewsets
 from celery.result import AsyncResult
 from rest_framework import generics
+from django_celery_beat.models import PeriodicTask
 
 from common.permissions import IsValidUser
 from common.api import LogTailApi
 from ..models import CeleryTask
-from ..serializers import CeleryResultSerializer
+from ..serializers import CeleryResultSerializer, CeleryPeriodTaskSerializer
 from ..celery.utils import get_celery_task_log_path
+from ..ansible.utils import get_ansible_task_log_path
+from common.mixins.api import CommonApiMixin
 
 
-__all__ = ['CeleryTaskLogApi', 'CeleryResultApi']
+__all__ = [
+    'CeleryTaskLogApi', 'CeleryResultApi', 'CeleryPeriodTaskViewSet',
+    'AnsibleTaskLogApi',
+]
 
 
 class CeleryTaskLogApi(LogTailApi):
@@ -54,6 +61,21 @@ class CeleryTaskLogApi(LogTailApi):
             return _('Waiting task start')
 
 
+class AnsibleTaskLogApi(LogTailApi):
+    permission_classes = (IsValidUser,)
+
+    def get_log_path(self):
+        new_path = get_ansible_task_log_path(self.kwargs.get('pk'))
+        if new_path and os.path.isfile(new_path):
+            return new_path
+
+    def get_no_file_message(self, request):
+        if self.mark == 'undefined':
+            return '.'
+        else:
+            return _('Waiting task start')
+
+
 class CeleryResultApi(generics.RetrieveAPIView):
     permission_classes = (IsValidUser,)
     serializer_class = CeleryResultSerializer
@@ -62,3 +84,13 @@ class CeleryResultApi(generics.RetrieveAPIView):
         pk = self.kwargs.get('pk')
         return AsyncResult(pk)
 
+
+class CeleryPeriodTaskViewSet(CommonApiMixin, viewsets.ModelViewSet):
+    queryset = PeriodicTask.objects.all()
+    serializer_class = CeleryPeriodTaskSerializer
+    http_method_names = ('get', 'head', 'options', 'patch')
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        queryset = queryset.exclude(description='')
+        return queryset

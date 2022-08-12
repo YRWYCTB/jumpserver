@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 #
 import re
+import json
 from six import string_types
 import base64
 import os
 import time
 import hashlib
 from io import StringIO
+from itertools import chain
 
 import paramiko
 import sshpubkeys
@@ -15,9 +17,10 @@ from itsdangerous import (
     BadSignature, SignatureExpired
 )
 from django.conf import settings
+from django.core.serializers.json import DjangoJSONEncoder
+from django.db.models.fields.files import FileField
 
 from .http import http_date
-
 
 UUID_PATTERN = re.compile(r'[0-9a-zA-Z\-]{36}')
 
@@ -37,6 +40,7 @@ class Singleton(type):
 
 class Signer(metaclass=Singleton):
     """用来加密,解密,和基于时间戳的方式验证token"""
+
     def __init__(self, secret_key=None):
         self.secret_key = secret_key
 
@@ -71,19 +75,29 @@ def ssh_key_string_to_obj(text, password=None):
         key = paramiko.RSAKey.from_private_key(StringIO(text), password=password)
     except paramiko.SSHException:
         pass
+    else:
+        return key
 
     try:
         key = paramiko.DSSKey.from_private_key(StringIO(text), password=password)
     except paramiko.SSHException:
         pass
+    else:
+        return key
+
     return key
 
 
-def ssh_pubkey_gen(private_key=None, username='jumpserver', hostname='localhost', password=None):
+def ssh_private_key_gen(private_key, password=None):
     if isinstance(private_key, bytes):
         private_key = private_key.decode("utf-8")
     if isinstance(private_key, string_types):
         private_key = ssh_key_string_to_obj(private_key, password=password)
+    return private_key
+
+
+def ssh_pubkey_gen(private_key=None, username='jumpserver', hostname='localhost', password=None):
+    private_key = ssh_private_key_gen(private_key, password=password)
     if not isinstance(private_key, (paramiko.RSAKey, paramiko.DSSKey)):
         raise IOError('Invalid private key')
 
@@ -172,17 +186,44 @@ def make_signature(access_key_secret, date=None):
     return content_md5(data)
 
 
-def encrypt_password(password, salt=None):
-    from passlib.hash import sha512_crypt
-    if password:
+def encrypt_password(password, salt=None, algorithm='sha512'):
+    from passlib.hash import sha512_crypt, des_crypt
+
+    def sha512():
         return sha512_crypt.using(rounds=5000).hash(password, salt=salt)
+
+    def des():
+        return des_crypt.hash(password, salt=salt[:2])
+
+    support_algorithm = {
+        'sha512': sha512,
+        'des': des
+    }
+
+    if isinstance(algorithm, str):
+        algorithm = algorithm.lower()
+
+    if algorithm not in support_algorithm.keys():
+        algorithm = 'sha512'
+
+    if password and support_algorithm[algorithm]:
+        return support_algorithm[algorithm]()
     return None
 
 
 def get_signer():
-    signer = Signer(settings.SECRET_KEY)
-    return signer
+    s = Signer(settings.SECRET_KEY)
+    return s
+
+
+signer = get_signer()
 
 
 def ensure_last_char_is_ascii(data):
     remain = ''
+
+
+def data_to_json(data, sort_keys=True, indent=2, cls=None):
+    if cls is None:
+        cls = DjangoJSONEncoder
+    return json.dumps(data, sort_keys=sort_keys, indent=indent, cls=cls)

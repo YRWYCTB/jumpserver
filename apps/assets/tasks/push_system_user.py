@@ -1,75 +1,121 @@
 # ~*~ coding: utf-8 ~*~
 
+from itertools import groupby
 from celery import shared_task
-from django.utils.translation import ugettext as _
+from common.db.utils import get_object_if_need, get_objects
+from django.utils.translation import ugettext as _, gettext_noop
+from django.db.models import Empty
 
 from common.utils import encrypt_password, get_logger
+from assets.models import SystemUser, Asset
+from orgs.utils import org_aware_func, tmp_to_root_org
 from . import const
-from .utils import clean_hosts_by_protocol, clean_hosts
+from .utils import clean_ansible_task_hosts, group_asset_by_platform
 
 
 logger = get_logger(__file__)
 __all__ = [
     'push_system_user_util', 'push_system_user_to_assets',
     'push_system_user_to_assets_manual', 'push_system_user_a_asset_manual',
+    'push_system_users_a_asset'
 ]
 
 
-def get_push_linux_system_user_tasks(system_user):
+def _split_by_comma(raw: str):
+    try:
+        return [i.strip() for i in raw.split(',')]
+    except AttributeError:
+        return []
+
+
+def _dump_args(args: dict):
+    return ' '.join([f'{k}={v}' for k, v in args.items() if v is not Empty])
+
+
+def get_push_unixlike_system_user_tasks(system_user, username=None, **kwargs):
+    algorithm = kwargs.get('algorithm')
+    if username is None:
+        username = system_user.username
+
+    comment = system_user.name
+    if system_user.username_same_with_user:
+        from users.models import User
+        user = User.objects.filter(username=username).only('name', 'username').first()
+        if user:
+            comment = f'{system_user.name}[{str(user)}]'
+    comment = comment.replace(' ', '')
+
+    password = system_user.password
+    public_key = system_user.public_key
+
+    groups = _split_by_comma(system_user.system_groups)
+
+    if groups:
+        groups = '"%s"' % ','.join(groups)
+
+    add_user_args = {
+        'name': username,
+        'shell': system_user.shell or Empty,
+        'state': 'present',
+        'home': system_user.home or Empty,
+        'expires': -1,
+        'groups': groups or Empty,
+        'comment': comment
+    }
+
     tasks = [
         {
-            'name': 'Add user {}'.format(system_user.username),
+            'name': 'Add user {}'.format(username),
             'action': {
                 'module': 'user',
-                'args': 'name={} shell={} state=present'.format(
-                    system_user.username, system_user.shell,
-                ),
+                'args': _dump_args(add_user_args),
             }
         },
         {
-            'name': 'Add group {}'.format(system_user.username),
+            'name': 'Add group {}'.format(username),
             'action': {
                 'module': 'group',
-                'args': 'name={} state=present'.format(
-                    system_user.username,
-                ),
+                'args': 'name={} state=present'.format(username),
             }
-        },
-        {
-            'name': 'Check home dir exists',
-            'action': {
-                'module': 'stat',
-                'args': 'path=/home/{}'.format(system_user.username)
-            },
-            'register': 'home_existed'
-        },
-        {
-            'name': "Set home dir permission",
-            'action': {
-                'module': 'file',
-                'args': "path=/home/{0} owner={0} group={0} mode=700".format(system_user.username)
-            },
-            'when': 'home_existed.stat.exists == true'
         }
     ]
-    if system_user.password:
+    if not system_user.home:
+        tasks.extend([
+            {
+                'name': 'Check home dir exists',
+                'action': {
+                    'module': 'stat',
+                    'args': 'path=/home/{}'.format(username)
+                },
+                'register': 'home_existed'
+            },
+            {
+                'name': "Set home dir permission",
+                'action': {
+                    'module': 'file',
+                    'args': "path=/home/{0} owner={0} group={0} mode=700".format(username)
+                },
+                'when': 'home_existed.stat.exists == true'
+            }
+        ])
+    if password:
         tasks.append({
-            'name': 'Set {} password'.format(system_user.username),
+            'name': 'Set {} password'.format(username),
             'action': {
                 'module': 'user',
                 'args': 'name={} shell={} state=present password={}'.format(
-                    system_user.username, system_user.shell,
-                    encrypt_password(system_user.password, salt="K3mIlKK"),
+                    username, system_user.shell,
+                    encrypt_password(password, salt="K3mIlKK", algorithm=algorithm),
                 ),
             }
         })
-    if system_user.public_key:
+    if public_key:
         tasks.append({
-            'name': 'Set {} authorized key'.format(system_user.username),
+            'name': 'Set {} authorized key'.format(username),
             'action': {
                 'module': 'authorized_key',
                 'args': "user={} state=present key='{}'".format(
-                    system_user.username, system_user.public_key
+                    username, public_key
                 )
             }
         })
@@ -81,26 +127,38 @@ def get_push_linux_system_user_tasks(system_user):
             sudo_tmp.append(s.strip(','))
         sudo = ','.join(sudo_tmp)
         tasks.append({
-            'name': 'Set {} sudo setting'.format(system_user.username),
+            'name': 'Set {} sudo setting'.format(username),
             'action': {
                 'module': 'lineinfile',
                 'args': "dest=/etc/sudoers state=present regexp='^{0} ALL=' "
                         "line='{0} ALL=(ALL) NOPASSWD: {1}' "
-                        "validate='visudo -cf %s'".format(
-                    system_user.username, sudo,
-                )
+                        "validate='visudo -cf %s'".format(username, sudo)
             }
         })
 
     return tasks
 
 
-def get_push_windows_system_user_tasks(system_user):
+def get_push_windows_system_user_tasks(system_user: SystemUser, username=None, **kwargs):
+    if username is None:
+        username = system_user.username
+    password = system_user.password
+    groups = {'Users', 'Remote Desktop Users'}
+    if system_user.system_groups:
+        groups.update(_split_by_comma(system_user.system_groups))
+    groups = ','.join(groups)
+
     tasks = []
-    if not system_user.password:
+    if not password:
+        logger.error("Error: no password found")
         return tasks
-    tasks.append({
-        'name': 'Add user {}'.format(system_user.username),
+
+    if system_user.ad_domain:
+        logger.error('System user with AD domain do not support push.')
+        return tasks
+
+    task = {
+        'name': 'Add user {}'.format(username),
         'action': {
             'module': 'win_user',
             'args': 'fullname={} '
@@ -110,88 +168,135 @@ def get_push_windows_system_user_tasks(system_user):
                     'update_password=always '
                     'password_expired=no '
                     'password_never_expires=yes '
-                    'groups="Users,Remote Desktop Users" '
+                    'groups="{}" '
                     'groups_action=add '
-                    ''.format(system_user.name,
-                              system_user.username,
-                              system_user.password),
+                    ''.format(username, username, password, groups),
         }
-    })
+    }
+    tasks.append(task)
     return tasks
 
 
-def get_push_system_user_tasks(host, system_user):
-    if host.is_unixlike():
-        tasks = get_push_linux_system_user_tasks(system_user)
-    elif host.is_windows():
-        tasks = get_push_windows_system_user_tasks(system_user)
-    else:
-        msg = _(
-            "The asset {} system platform {} does not "
-            "support run Ansible tasks".format(host.hostname, host.platform)
-        )
-        logger.info(msg)
-        tasks = []
+def get_push_system_user_tasks(system_user, platform="unixlike", username=None, algorithm=None):
+    """
+    获取推送系统用户的 ansible 命令，跟资产无关
+    :param system_user:
+    :param platform:
+    :param username: 当动态时，近推送某个
+    :return:
+    """
+    get_task_map = {
+        "unixlike": get_push_unixlike_system_user_tasks,
+        "windows": get_push_windows_system_user_tasks,
+    }
+    get_tasks = get_task_map.get(platform, get_push_unixlike_system_user_tasks)
+    if not system_user.username_same_with_user:
+        return get_tasks(system_user, algorithm=algorithm)
+    tasks = []
+    # 仅推送这个username
+    if username is not None:
+        tasks.extend(get_tasks(system_user, username, algorithm=algorithm))
+        return tasks
+    users = system_user.users.all().values_list('username', flat=True)
+    print(_("System user is dynamic: {}").format(list(users)))
+    for _username in users:
+        tasks.extend(get_tasks(system_user, _username, algorithm=algorithm))
     return tasks
 
 
-@shared_task(queue="ansible")
-def push_system_user_util(system_user, assets, task_name):
+@org_aware_func("system_user")
+def push_system_user_util(system_user, assets, task_name, username=None):
     from ops.utils import update_or_create_ansible_task
-    if not system_user.is_need_push():
-        msg = _("Push system user task skip, auto push not enable or "
-                "protocol is not ssh or rdp: {}").format(system_user.name)
-        logger.info(msg)
+    assets = clean_ansible_task_hosts(assets, system_user=system_user)
+    if not assets:
         return {}
 
-    # Set root as system user is dangerous
-    if system_user.username.lower() in ["root", "administrator"]:
-        msg = _("For security, do not push user {}".format(system_user.username))
-        logger.info(msg)
-        return {}
+    # 资产按平台分类
+    assets_sorted = sorted(assets, key=group_asset_by_platform)
+    platform_hosts = groupby(assets_sorted, key=group_asset_by_platform)
 
-    hosts = clean_hosts(assets)
-    if not hosts:
-        return {}
+    if system_user.username_same_with_user:
+        if username is None:
+            # 动态系统用户，但是没有指定 username
+            usernames = list(system_user.users.all().values_list('username', flat=True).distinct())
+        else:
+            usernames = [username]
+    else:
+        # 非动态系统用户指定 username 无效
+        assert username is None, 'Only Dynamic user can assign `username`'
+        usernames = [system_user.username]
 
-    hosts = clean_hosts_by_protocol(system_user, hosts)
-    if not hosts:
-        return {}
-
-    for host in hosts:
-        system_user.load_specific_asset_auth(host)
-        tasks = get_push_system_user_tasks(host, system_user)
-        if not tasks:
-            continue
+    def run_task(_tasks, _hosts):
+        if not _tasks:
+            return
         task, created = update_or_create_ansible_task(
-            task_name=task_name, hosts=[host], tasks=tasks, pattern='all',
+            task_name=task_name, hosts=_hosts, tasks=_tasks, pattern='all',
             options=const.TASK_OPTIONS, run_as_admin=True,
-            created_by=system_user.org_id,
         )
         task.run()
 
+    for platform, _assets in platform_hosts:
+        _assets = list(_assets)
+        if not _assets:
+            continue
+        print(_("Start push system user for platform: [{}]").format(platform))
+        print(_("Hosts count: {}").format(len(_assets)))
+
+        for u in usernames:
+            for a in _assets:
+                system_user.load_asset_special_auth(a, u)
+                algorithm = 'des' if a.platform.name == 'AIX' else 'sha512'
+                tasks = get_push_system_user_tasks(
+                    system_user, platform, username=u,
+                    algorithm=algorithm
+                )
+                run_task(tasks, [a])
+
 
 @shared_task(queue="ansible")
-def push_system_user_to_assets_manual(system_user):
-    assets = system_user.get_all_assets()
-    task_name = _("Push system users to assets: {}").format(system_user.name)
-    return push_system_user_util(system_user, assets, task_name=task_name)
+@tmp_to_root_org()
+def push_system_user_to_assets_manual(system_user, username=None):
+    """
+    将系统用户推送到与它关联的所有资产上
+    """
+    system_user = get_object_if_need(SystemUser, system_user)
+    assets = system_user.get_related_assets()
+    task_name = gettext_noop("Push system users to assets: ") + system_user.name
+    return push_system_user_util(system_user, assets, task_name=task_name, username=username)
 
 
 @shared_task(queue="ansible")
-def push_system_user_a_asset_manual(system_user, asset):
-    task_name = _("Push system users to asset: {} => {}").format(
-        system_user.name, asset
+@tmp_to_root_org()
+def push_system_user_a_asset_manual(system_user, asset, username=None):
+    """
+    将系统用户推送到一个资产上
+    """
+    # if username is None:
+    #     username = system_user.username
+    task_name = gettext_noop("Push system users to asset: ") + "{}({}) => {}".format(
+        system_user.name, username or system_user.username, asset
     )
-    return push_system_user_util(system_user, [asset], task_name=task_name)
+    return push_system_user_util(system_user, [asset], task_name=task_name, username=username)
 
 
 @shared_task(queue="ansible")
-def push_system_user_to_assets(system_user, assets):
-    task_name = _("Push system users to assets: {}").format(system_user.name)
-    return push_system_user_util(system_user, assets, task_name)
+@tmp_to_root_org()
+def push_system_users_a_asset(system_users, asset):
+    for system_user in system_users:
+        push_system_user_a_asset_manual(system_user, asset)
 
 
+@shared_task(queue="ansible")
+@tmp_to_root_org()
+def push_system_user_to_assets(system_user_id, asset_ids, username=None):
+    """
+    推送系统用户到指定的若干资产上
+    """
+    system_user = SystemUser.objects.get(id=system_user_id)
+    assets = get_objects(Asset, asset_ids)
+    task_name = gettext_noop("Push system users to assets: ") + system_user.name
+
+    return push_system_user_util(system_user, assets, task_name, username=username)
 
 # @shared_task
 # @register_as_period_task(interval=3600)

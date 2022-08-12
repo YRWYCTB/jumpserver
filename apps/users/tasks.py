@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 #
 
-import sys
 from celery import shared_task
 from django.conf import settings
+from django.utils import timezone
 
+from users.notifications import PasswordExpirationReminderMsg
 from ops.celery.utils import (
     create_or_update_celery_periodic_tasks, disable_celery_periodic_task
 )
 from ops.celery.decorator import after_app_ready_start
 from common.utils import get_logger
+from orgs.models import Organization
 from .models import User
-from .utils import (
-    send_password_expiration_reminder_mail, send_user_expiration_reminder_mail
-)
+from users.notifications import UserExpirationReminderMsg
 from settings.utils import LDAPServerUtil, LDAPImportUtil
 
 
@@ -22,15 +22,16 @@ logger = get_logger(__file__)
 
 @shared_task
 def check_password_expired():
-    users = User.objects.exclude(role=User.ROLE_APP)
+    users = User.get_nature_users().filter(source=User.Source.local)
     for user in users:
         if not user.is_valid:
             continue
         if not user.password_will_expired:
             continue
-        send_password_expiration_reminder_mail(user)
         msg = "The user {} password expires in {} days"
         logger.info(msg.format(user, user.password_expired_remain_days))
+
+        PasswordExpirationReminderMsg(user).publish_async()
 
 
 @shared_task
@@ -49,13 +50,19 @@ def check_password_expired_periodic():
 
 @shared_task
 def check_user_expired():
-    users = User.objects.exclude(role=User.ROLE_APP)
+    date_expired_lt = timezone.now() + timezone.timedelta(days=User.DATE_EXPIRED_WARNING_DAYS)
+    users = User.get_nature_users()\
+        .filter(source=User.Source.local)\
+        .filter(date_expired__lt=date_expired_lt)
+
     for user in users:
         if not user.is_valid:
             continue
         if not user.will_expired:
             continue
-        send_user_expiration_reminder_mail(user)
+        msg = "The user {} will expires in {} days"
+        logger.info(msg.format(user, user.expired_remain_days))
+        UserExpirationReminderMsg(user).publish_async()
 
 
 @shared_task
@@ -78,7 +85,15 @@ def import_ldap_user():
     util_server = LDAPServerUtil()
     util_import = LDAPImportUtil()
     users = util_server.search()
-    errors = util_import.perform_import(users)
+    if settings.XPACK_ENABLED:
+        org_id = settings.AUTH_LDAP_SYNC_ORG_ID
+        default_org = None
+    else:
+        # 社区版默认导入Default组织
+        org_id = Organization.DEFAULT_ID
+        default_org = Organization.default()
+    org = Organization.get_instance(org_id, default=default_org)
+    errors = util_import.perform_import(users, org)
     if errors:
         logger.error("Imported LDAP users errors: {}".format(errors))
     else:
@@ -90,8 +105,8 @@ def import_ldap_user():
 def import_ldap_user_periodic():
     if not settings.AUTH_LDAP:
         return
+    task_name = 'import_ldap_user_periodic'
     if not settings.AUTH_LDAP_SYNC_IS_PERIODIC:
-        task_name = sys._getframe().f_code.co_name
         disable_celery_periodic_task(task_name)
         return
 
@@ -101,8 +116,11 @@ def import_ldap_user_periodic():
     else:
         interval = None
     crontab = settings.AUTH_LDAP_SYNC_CRONTAB
+    if crontab:
+        # 优先使用 crontab
+        interval = None
     tasks = {
-        'import_ldap_user_periodic': {
+        task_name: {
             'task': import_ldap_user.name,
             'interval': interval,
             'crontab': crontab,

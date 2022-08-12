@@ -1,55 +1,52 @@
 # -*- coding: utf-8 -*-
 #
-from django.utils.translation import ugettext as _
-from django.contrib.auth import authenticate
+from urllib.parse import urljoin
 
-from common.utils import get_ip_city, get_object_or_none, validate_ip
-from users.models import User
-from . import const
+from django.conf import settings
+
+from common.utils import validate_ip, get_ip_city, get_request_ip
+from common.utils import get_logger
+from audits.models import UserLoginLog
+from audits.const import DEFAULT_CITY
+from .notifications import DifferentCityLoginMessage
+
+logger = get_logger(__file__)
 
 
-def write_login_log(*args, **kwargs):
-    from audits.models import UserLoginLog
-    default_city = _("Unknown")
-    ip = kwargs.get('ip') or ''
+def check_different_city_login_if_need(user, request):
+    if not settings.SECURITY_CHECK_DIFFERENT_CITY_LOGIN:
+        return
+
+    ip = get_request_ip(request) or '0.0.0.0'
     if not (ip and validate_ip(ip)):
-        ip = ip[:15]
-        city = default_city
+        city = DEFAULT_CITY
     else:
-        city = get_ip_city(ip) or default_city
-    kwargs.update({'ip': ip, 'city': city})
-    UserLoginLog.objects.create(**kwargs)
+        city = get_ip_city(ip) or DEFAULT_CITY
+
+    city_white = ['LAN', ]
+    if city not in city_white:
+        last_user_login = UserLoginLog.objects.exclude(city__in=city_white) \
+            .filter(username=user.username, status=True).first()
+
+        if last_user_login and last_user_login.city != city:
+            DifferentCityLoginMessage(user, ip, city).publish_async()
 
 
-def check_user_valid(**kwargs):
-    password = kwargs.pop('password', None)
-    public_key = kwargs.pop('public_key', None)
-    email = kwargs.pop('email', None)
-    username = kwargs.pop('username', None)
+def build_absolute_uri(request, path=None):
+    """ Build absolute redirect """
+    if path is None:
+        path = '/'
+    redirect_uri = request.build_absolute_uri(path)
+    return redirect_uri
 
-    if username:
-        user = get_object_or_none(User, username=username)
-    elif email:
-        user = get_object_or_none(User, email=email)
+
+def build_absolute_uri_for_oidc(request, path=None):
+    """ Build absolute redirect uri for OIDC """
+    if path is None:
+        path = '/'
+    if settings.BASE_SITE_URL:
+        # OIDC 专用配置项
+        redirect_uri = urljoin(settings.BASE_SITE_URL, path)
     else:
-        user = None
-
-    if user is None:
-        return None, const.user_not_exist
-    elif not user.is_valid:
-        return None, const.user_invalid
-    elif user.password_has_expired:
-        return None, const.password_expired
-
-    if password and authenticate(username=username, password=password):
-        return user, ''
-
-    if public_key and user.public_key:
-        public_key_saved = user.public_key.split()
-        if len(public_key_saved) == 1:
-            if public_key == public_key_saved[0]:
-                return user, ''
-        elif len(public_key_saved) > 1:
-            if public_key == public_key_saved[1]:
-                return user, ''
-    return None, const.password_failed
+        redirect_uri = request.build_absolute_uri(path)
+    return redirect_uri

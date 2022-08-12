@@ -15,6 +15,7 @@ dump.rdb
 .tox
 .cache/
 .idea/
+.vscode/
 db.sqlite3
 config.py
 config.yml
@@ -30,9 +31,13 @@ media
 celerybeat.pid
 django.db
 celerybeat-schedule.db
-data/static
 docs/_build/
 xpack
+xpack.bak
 logs/*
 ### Vagrant ###
 .vagrant/
+release/*
+releashe
+/apps/script.py
+data/*

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 #
+import io
 import os
 import uuid
 from hashlib import md5
@@ -7,45 +8,81 @@ from hashlib import md5
 import sshpubkeys
 from django.core.cache import cache
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 from django.conf import settings
+from django.db.models import QuerySet
 
+from common.utils import random_string, signer
 from common.utils import (
-    get_signer, ssh_key_string_to_obj, ssh_key_gen, get_logger
+    ssh_key_string_to_obj, ssh_key_gen, get_logger, lazyproperty
 )
+from common.utils.encode import ssh_pubkey_gen
 from common.validators import alphanumeric
-from common import fields
+from common.db import fields
 from orgs.mixins.models import OrgModelMixin
-from .utils import private_key_validator, Connectivity
 
-signer = get_signer()
 
 logger = get_logger(__file__)
 
 
-class AssetUser(OrgModelMixin):
-    id = models.UUIDField(default=uuid.uuid4, primary_key=True)
-    name = models.CharField(max_length=128, verbose_name=_('Name'))
-    username = models.CharField(max_length=32, blank=True, verbose_name=_('Username'), validators=[alphanumeric], db_index=True)
-    password = fields.EncryptCharField(max_length=256, blank=True, null=True, verbose_name=_('Password'))
-    private_key = fields.EncryptTextField(blank=True, null=True, verbose_name=_('SSH private key'))
-    public_key = fields.EncryptTextField(blank=True, null=True, verbose_name=_('SSH public key'))
-    comment = models.TextField(blank=True, verbose_name=_('Comment'))
-    date_created = models.DateTimeField(auto_now_add=True, verbose_name=_("Date created"))
-    date_updated = models.DateTimeField(auto_now=True, verbose_name=_("Date updated"))
-    created_by = models.CharField(max_length=128, null=True, verbose_name=_('Created by'))
+class Connectivity(models.TextChoices):
+    unknown = 'unknown', _('Unknown')
+    ok = 'ok', _('Ok')
+    failed = 'failed', _('Failed')
 
-    CONNECTIVITY_ASSET_CACHE_KEY = "ASSET_USER_{}_{}_ASSET_CONNECTIVITY"
-    CONNECTIVITY_AMOUNT_CACHE_KEY = "ASSET_USER_{}_{}_CONNECTIVITY_AMOUNT"
-    ASSETS_AMOUNT_CACHE_KEY = "ASSET_USER_{}_ASSETS_AMOUNT"
-    ASSET_USER_CACHE_TIME = 3600 * 24
 
-    _prefer = "system_user"
+class AbsConnectivity(models.Model):
+    connectivity = models.CharField(
+        choices=Connectivity.choices, default=Connectivity.unknown,
+        max_length=16, verbose_name=_('Connectivity')
+    )
+    date_verified = models.DateTimeField(null=True, verbose_name=_("Date verified"))
+
+    def set_connectivity(self, val):
+        self.connectivity = val
+        self.date_verified = timezone.now()
+        self.save(update_fields=['connectivity', 'date_verified'])
+
+    @classmethod
+    def bulk_set_connectivity(cls, queryset_or_id, connectivity):
+        if not isinstance(queryset_or_id, QuerySet):
+            queryset = cls.objects.filter(id__in=queryset_or_id)
+        else:
+            queryset = queryset_or_id
+        queryset.update(connectivity=connectivity, date_verified=timezone.now())
+
+    class Meta:
+        abstract = True
+
+
+class AuthMixin:
+    private_key = ''
+    password = ''
+    public_key = ''
+    username = ''
+
+    @property
+    def ssh_key_fingerprint(self):
+        if self.public_key:
+            public_key = self.public_key
+        elif self.private_key:
+            try:
+                public_key = ssh_pubkey_gen(private_key=self.private_key, password=self.password)
+            except IOError as e:
+                return str(e)
+        else:
+            return ''
+
+        public_key_obj = sshpubkeys.SSHKey(public_key)
+        fingerprint = public_key_obj.hash_md5()
+        return fingerprint
 
     @property
     def private_key_obj(self):
         if self.private_key:
-            return ssh_key_string_to_obj(self.private_key, password=self.password)
+            key_obj = ssh_key_string_to_obj(self.private_key, password=self.password)
+            return key_obj
         else:
             return None
 
@@ -62,6 +99,14 @@ class AssetUser(OrgModelMixin):
             os.chmod(key_path, 0o400)
         return key_path
 
+    def get_private_key(self):
+        if not self.private_key_obj:
+            return None
+        string_io = io.StringIO()
+        self.private_key_obj.write_private_key(string_io)
+        private_key = string_io.getvalue()
+        return private_key
+
     @property
     def public_key_obj(self):
         if self.public_key:
@@ -70,15 +115,6 @@ class AssetUser(OrgModelMixin):
             except TabError:
                 pass
         return None
-
-    @property
-    def part_id(self):
-        i = '-'.join(str(self.id).split('-')[:3])
-        return i
-
-    def get_related_assets(self):
-        assets = self.assets.all()
-        return assets
 
     def set_auth(self, password=None, private_key=None, public_key=None):
         update_fields = []
@@ -95,98 +131,12 @@ class AssetUser(OrgModelMixin):
         if update_fields:
             self.save(update_fields=update_fields)
 
-    def set_connectivity(self, summary):
-        unreachable = summary.get('dark', {}).keys()
-        reachable = summary.get('contacted', {}).keys()
-
-        assets = self.get_related_assets()
-        if not isinstance(assets, list):
-            assets = assets.only('id', 'hostname', 'admin_user__id')
-        for asset in assets:
-            if asset.hostname in unreachable:
-                self.set_asset_connectivity(asset, Connectivity.unreachable())
-            elif asset.hostname in reachable:
-                self.set_asset_connectivity(asset, Connectivity.reachable())
-            else:
-                self.set_asset_connectivity(asset, Connectivity.unknown())
-        cache_key = self.CONNECTIVITY_AMOUNT_CACHE_KEY.format(self.username, self.part_id)
-        cache.delete(cache_key)
-
-    @property
-    def connectivity(self):
-        assets = self.get_related_assets()
-        if not isinstance(assets, list):
-            assets = assets.only('id', 'hostname', 'admin_user__id')
-        data = {
-            'unreachable': [],
-            'reachable': [],
-            'unknown': [],
-        }
-        for asset in assets:
-            connectivity = self.get_asset_connectivity(asset)
-            if connectivity.is_reachable():
-                data["reachable"].append(asset.hostname)
-            elif connectivity.is_unreachable():
-                data["unreachable"].append(asset.hostname)
-            else:
-                data["unknown"].append(asset.hostname)
-        return data
-
-    @property
-    def connectivity_amount(self):
-        cache_key = self.CONNECTIVITY_AMOUNT_CACHE_KEY.format(self.username, self.part_id)
-        amount = cache.get(cache_key)
-        if not amount:
-            amount = {k: len(v) for k, v in self.connectivity.items()}
-            cache.set(cache_key, amount, self.ASSET_USER_CACHE_TIME)
-        return amount
-
-    @property
-    def assets_amount(self):
-        cache_key = self.ASSETS_AMOUNT_CACHE_KEY.format(self.id)
-        cached = cache.get(cache_key)
-        if not cached:
-            cached = self.get_related_assets().count()
-            cache.set(cache_key, cached, self.ASSET_USER_CACHE_TIME)
-        return cached
-
-    def expire_assets_amount(self):
-        cache_key = self.ASSETS_AMOUNT_CACHE_KEY.format(self.id)
-        cache.delete(cache_key)
-
-    def get_asset_connectivity(self, asset):
-        key = self.get_asset_connectivity_key(asset)
-        return Connectivity.get(key)
-
-    def get_asset_connectivity_key(self, asset):
-        return self.CONNECTIVITY_ASSET_CACHE_KEY.format(self.username, asset.id)
-
-    def set_asset_connectivity(self, asset, c):
-        key = self.get_asset_connectivity_key(asset)
-        Connectivity.set(key, c)
-
-    def get_asset_user(self, asset):
-        from ..backends import AssetUserManager
-        try:
-            manager = AssetUserManager().prefer(self._prefer)
-            other = manager.get(username=self.username, asset=asset, prefer_id=self.id)
-            return other
-        except Exception as e:
-            logger.error(e, exc_info=True)
-            return None
-
-    def load_specific_asset_auth(self, asset):
-        instance = self.get_asset_user(asset)
-        if instance:
-            self._merge_auth(instance)
-
     def _merge_auth(self, other):
         if other.password:
             self.password = other.password
-        if other.public_key:
-            self.public_key = other.public_key
-        if other.private_key:
+        if other.public_key or other.private_key:
             self.private_key = other.private_key
+            self.public_key = other.public_key
 
     def clear_auth(self):
         self.password = ''
@@ -195,8 +145,8 @@ class AssetUser(OrgModelMixin):
         self.save()
 
     @staticmethod
-    def gen_password():
-        return str(uuid.uuid4())
+    def gen_password(length=36):
+        return random_string(length, special_char=True)
 
     @staticmethod
     def gen_key(username):
@@ -205,19 +155,72 @@ class AssetUser(OrgModelMixin):
         )
         return private_key, public_key
 
-    def auto_gen_auth(self):
-        password = str(uuid.uuid4())
-        private_key, public_key = ssh_key_gen(
-            username=self.username
-        )
+    def auto_gen_auth(self, password=True, key=True):
+        _password = None
+        _private_key = None
+        _public_key = None
+
+        if password:
+            _password = self.gen_password()
+        if key:
+            _private_key, _public_key = self.gen_key(self.username)
         self.set_auth(
-            password=password, private_key=private_key,
-            public_key=public_key
+            password=_password, private_key=_private_key,
+            public_key=_public_key
         )
 
-    def auto_gen_auth_password(self):
-        password = str(uuid.uuid4())
-        self.set_auth(password=password)
+
+class BaseUser(OrgModelMixin, AuthMixin):
+    id = models.UUIDField(default=uuid.uuid4, primary_key=True)
+    name = models.CharField(max_length=128, verbose_name=_('Name'))
+    username = models.CharField(max_length=128, blank=True, verbose_name=_('Username'), db_index=True)
+    password = fields.EncryptCharField(max_length=256, blank=True, null=True, verbose_name=_('Password'))
+    private_key = fields.EncryptTextField(blank=True, null=True, verbose_name=_('SSH private key'))
+    public_key = fields.EncryptTextField(blank=True, null=True, verbose_name=_('SSH public key'))
+    comment = models.TextField(blank=True, verbose_name=_('Comment'))
+    date_created = models.DateTimeField(auto_now_add=True, verbose_name=_("Date created"))
+    date_updated = models.DateTimeField(auto_now=True, verbose_name=_("Date updated"))
+    created_by = models.CharField(max_length=128, null=True, verbose_name=_('Created by'))
+
+    ASSETS_AMOUNT_CACHE_KEY = "ASSET_USER_{}_ASSETS_AMOUNT"
+    ASSET_USER_CACHE_TIME = 600
+
+    APPS_AMOUNT_CACHE_KEY = "APP_USER_{}_APPS_AMOUNT"
+    APP_USER_CACHE_TIME = 600
+
+    def get_related_assets(self):
+        assets = self.assets.filter(org_id=self.org_id)
+        return assets
+
+    def get_related_apps(self):
+        from applications.models import Account
+        apps = Account.objects.filter(systemuser=self)
+        return apps
+
+    def get_username(self):
+        return self.username
+
+    @lazyproperty
+    def assets_amount(self):
+        cache_key = self.ASSETS_AMOUNT_CACHE_KEY.format(self.id)
+        cached = cache.get(cache_key)
+        if not cached:
+            cached = self.get_related_assets().count()
+            cache.set(cache_key, cached, self.ASSET_USER_CACHE_TIME)
+        return cached
+
+    @property
+    def apps_amount(self):
+        cache_key = self.APPS_AMOUNT_CACHE_KEY.format(self.id)
+        cached = cache.get(cache_key)
+        if not cached:
+            cached = self.get_related_apps().count()
+            cache.set(cache_key, cached, self.APP_USER_CACHE_TIME)
+        return cached
+
+    def expire_assets_amount(self):
+        cache_key = self.ASSETS_AMOUNT_CACHE_KEY.format(self.id)
+        cache.delete(cache_key)
 
     def _to_secret_json(self):
         """Push system user use it"""
@@ -228,26 +231,6 @@ class AssetUser(OrgModelMixin):
             'public_key': self.public_key,
             'private_key': self.private_key_file,
         }
-
-    def generate_id_with_asset(self, asset):
-        user_id = [self.part_id]
-        asset_id = str(asset.id).split('-')[3:]
-        ids = user_id + asset_id
-        return '-'.join(ids)
-
-    def construct_to_authbook(self, asset):
-        from . import AuthBook
-        fields = [
-            'name', 'username', 'comment', 'org_id',
-            'password', 'private_key', 'public_key',
-            'date_created', 'date_updated', 'created_by'
-        ]
-        i = self.generate_id_with_asset(asset)
-        obj = AuthBook(id=i, asset=asset, version=0, is_latest=True)
-        for field in fields:
-            value = getattr(self, field)
-            setattr(obj, field, value)
-        return obj
 
     class Meta:
         abstract = True

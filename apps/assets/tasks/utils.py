@@ -7,7 +7,8 @@ from common.utils import get_logger
 
 logger = get_logger(__file__)
 __all__ = [
-    'check_asset_can_run_ansible', 'clean_hosts', 'clean_hosts_by_protocol'
+    'check_asset_can_run_ansible', 'clean_ansible_task_hosts',
+    'group_asset_by_platform',
 ]
 
 
@@ -23,23 +24,42 @@ def check_asset_can_run_ansible(asset):
     return True
 
 
-def clean_hosts(assets):
-    clean_assets = []
+def check_system_user_can_run_ansible(system_user):
+    if not system_user.auto_push:
+        logger.warn(f'Push system user task skip, auto push not enable: system_user={system_user.name}')
+        return False
+    if not system_user.is_protocol_support_push:
+        logger.warn(f'Push system user task skip, protocol not support: '
+                    f'system_user={system_user.name} protocol={system_user.protocol} '
+                    f'support_protocol={system_user.SUPPORT_PUSH_PROTOCOLS}')
+        return False
+
+    # Push root as system user is dangerous
+    if system_user.username.lower() in ["root", "administrator"]:
+        msg = _("For security, do not push user {}".format(system_user.username))
+        logger.info(msg)
+        return False
+
+    return True
+
+
+def clean_ansible_task_hosts(assets, system_user=None):
+    if system_user and not check_system_user_can_run_ansible(system_user):
+        return []
+    cleaned_assets = []
     for asset in assets:
         if not check_asset_can_run_ansible(asset):
             continue
-        clean_assets.append(asset)
-    if not clean_assets:
+        cleaned_assets.append(asset)
+    if not cleaned_assets:
         logger.info(_("No assets matched, stop task"))
-    return clean_assets
+    return cleaned_assets
 
 
-def clean_hosts_by_protocol(system_user, assets):
-    hosts = [
-        asset for asset in assets
-        if asset.has_protocol(system_user.protocol)
-    ]
-    if not hosts:
-        msg = _("No assets matched related system user protocol, stop task")
-        logger.info(msg)
-    return hosts
+def group_asset_by_platform(asset):
+    if asset.is_unixlike():
+        return 'unixlike'
+    elif asset.is_windows():
+        return 'windows'
+    else:
+        return 'other'
